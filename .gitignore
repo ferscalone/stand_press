@@ -1,0 +1,25 @@
+# PlatformIO build artifacts and local state
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Optional local IDE metadata
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Temporary / backup files
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+docs/
+
+# Учётные данные WiFi и готовые образы прошивки (в образе зашит пароль)
+src/Secrets.h
+release/
