@@ -50,6 +50,17 @@ void StepperMotor::writeDir(bool forward) {
   }
 }
 
+void StepperMotor::setEnabled(bool enabled) {
+  enabled_ = enabled;
+  // EN+ постоянно в 1; EN- = 1 - ток через оптопару не идёт (драйвер включён),
+  // EN- = 0 - ток идёт (драйвер отключён).
+  digitalWrite(Config::PIN_EN_N, enabled ? HIGH : LOW);
+}
+
+bool StepperMotor::isEnabled() const {
+  return enabled_;
+}
+
 void StepperMotor::stop() {
   writeStep(false);
 }
@@ -62,6 +73,11 @@ void StepperMotor::setDirection(bool forward) {
 void StepperMotor::moveSteps(int32_t steps, uint32_t stepIntervalUs) {
   if (steps == 0) {
     return;
+  }
+
+  if (!enabled_) {
+    setEnabled(true);
+    delay(Config::MOTOR_ENABLE_SETTLE_MS);
   }
 
   const bool forward = steps > 0;

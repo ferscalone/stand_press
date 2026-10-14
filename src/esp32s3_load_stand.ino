@@ -170,16 +170,62 @@ volatile HomeDirPolicy gRehomePolicy = HomeDirPolicy::BY_LOAD;
 volatile bool gBootHomeRequested = false;
 
 // ── Калибровка нуля кулачков (состояние CALIBRATE) ───────────────────────────
-// Направление вращения (+1 / -1), выставляется при входе в CALIBRATE (onCommand).
-volatile int8_t gCalibDir = 1;
-// Запрос завершения: motorTask останавливает вал и принимает текущий угол за новый
-// ноль. Поднимается командой STOP или кнопкой на стенде.
+// Пишут onCommand (сетевые команды, задача loop) и кнопка; читает и исполняет
+// motorTask (calibrateTick).
+// Непрерывное вращение: 0 - стоим, +1 / -1 - крутим до команды «стоп».
+volatile int8_t gCalibRunDir = 0;
+// Остаток поворота на заданный угол, в шагах со знаком направления. Нажатия
+// суммируются; motorTask снимает по одному шагу. Свой spinlock: пишут и читают
+// разные задачи.
+portMUX_TYPE gCalibMux = portMUX_INITIALIZER_UNLOCKED;
+volatile int32_t gCalibJogPending = 0;
+// Запрос «сохранить ноль»: motorTask останавливает вал и принимает текущий угол за
+// новый ноль.
 volatile bool gCalibFinishRequested = false;
-// Запрос отмены (команда HOME): остановить, ноль не менять, вернуться к прежнему.
+// Запрос отмены: остановить, ноль не менять, вернуться к прежнему.
 volatile bool gCalibCancelRequested = false;
-// Точка старта (шаги мотора) и стартовая нагрузка - для защит по ходу и по нагрузке.
+// Запрос «стоп»: прекратить вращение / поворот, остаться в режиме калибровки.
+volatile bool gCalibHaltRequested = false;
+// Точка старта движения (шаги мотора) и стартовая нагрузка - для защит по ходу и
+// по нагрузке; время последней активности - для выхода по бездействию.
 volatile int32_t gCalibStartSteps = 0;
 volatile float gCalibStartLoadKg = 0.0f;
+volatile uint32_t gCalibActivityMs = 0;
+
+void addCalibJog(int32_t steps) {
+  portENTER_CRITICAL(&gCalibMux);
+  gCalibJogPending += steps;
+  portEXIT_CRITICAL(&gCalibMux);
+}
+
+void clearCalibJog() {
+  portENTER_CRITICAL(&gCalibMux);
+  gCalibJogPending = 0;
+  portEXIT_CRITICAL(&gCalibMux);
+}
+
+int32_t getCalibJogPending() {
+  portENTER_CRITICAL(&gCalibMux);
+  const int32_t v = gCalibJogPending;
+  portEXIT_CRITICAL(&gCalibMux);
+  return v;
+}
+
+// Снимает один шаг из остатка поворота. Возвращает его направление (+1 / -1) или 0,
+// если поворачивать нечего.
+int8_t takeCalibJogStep() {
+  int8_t dir = 0;
+  portENTER_CRITICAL(&gCalibMux);
+  if (gCalibJogPending > 0) {
+    dir = 1;
+    --gCalibJogPending;
+  } else if (gCalibJogPending < 0) {
+    dir = -1;
+    ++gCalibJogPending;
+  }
+  portEXIT_CRITICAL(&gCalibMux);
+  return dir;
+}
 // Базовая линия текущего минимума нагрузки для реактивной защиты от стенки в
 // RETURN_HOME. Сохраняется между тиками motorTask; сбрасывается в -1 (не захвачено)
 // при переходе В RETURN_HOME и отслеживается вниз по мере сброса нагрузки.
@@ -332,6 +378,8 @@ void getTelemetrySnapshot(TelemetrySnapshot& out) {
   portEXIT_CRITICAL(&gOffset.mux);
 
   out.homeAbsDeg = getHomeAngleDeg();
+  out.motorEnabled = gMotor.isEnabled();
+  out.calibBusy = (gCalibRunDir != 0) || (getCalibJogPending() != 0);
 }
 
 bool waitForFreshLoadSample(uint32_t previousUpdateMs, uint32_t timeoutMs = Config::HX711_CONTROL_SAMPLE_FRESHNESS_MS) {
@@ -387,16 +435,44 @@ enum class MeasureMode : uint8_t {
 //
 // Имя enum BY_LOAD сохранено для совместимости исходников, но теперь означает
 // "на основе угла+дуги". ALWAYS_MINUS / ALWAYS_PLUS задают фиксированное направление (зарезервировано).
+//
+// ОБНОВЛЕНО: правило «мёртвая зона -> длинным путём в +» отменено по результатам
+// работы на стенде. Теперь BY_LOAD всегда ведёт вал в одну сторону -
+// Config::HOME_DIRECTION (по умолчанию «-»), при необходимости почти полный оборот.
+// Единственное исключение - небольшой перелёт за ноль (до HOME_OVERSHOOT_BAND_DEG):
+// тогда короткий ход обратно, а не лишний оборот.
 int32_t homeStepDir(HomeDirPolicy policy, float absoluteDeg) {
   if (policy == HomeDirPolicy::ALWAYS_MINUS) return -Config::HOME_STEP_CHUNK;
   if (policy == HomeDirPolicy::ALWAYS_PLUS) return Config::HOME_STEP_CHUNK;
-  // BY_LOAD (на основе угла+дуги). Смещение от домашней позиции в направлении +,
-  // нормализованное к [0, 360). На дуге нагрузки -> шаг - к домашней позиции; в
-  // мёртвой зоне -> шаг + к домашней позиции (длинным путём, никогда через стенку).
-  const float plusOffset =
-      EncoderTracker::normalizeDegrees(absoluteDeg - getHomeAngleDeg());
-  const bool onLoadArc = (plusOffset > 0.0f) && (plusOffset <= Config::LOAD_ARC_WIDTH_DEG);
-  return onLoadArc ? -Config::HOME_STEP_CHUNK : Config::HOME_STEP_CHUNK;
+  const int32_t dir = Config::HOME_DIRECTION;
+  const float delta = EncoderTracker::shortestDeltaDegrees(getHomeAngleDeg(), absoluteDeg);
+  // Перелёт: вал уже прошёл ноль в направлении dir (знак delta совпадает с dir).
+  if ((delta * dir) > 0.0f && fabsf(delta) <= Config::HOME_OVERSHOOT_BAND_DEG) {
+    return -dir * Config::HOME_STEP_CHUNK;
+  }
+  return dir * Config::HOME_STEP_CHUNK;
+}
+
+// Вал на дуге нагрузки (0 < смещение от дома в «+» <= LOAD_ARC_WIDTH_DEG). Только
+// здесь движение к дому гарантированно сбрасывает нагрузку, поэтому только здесь
+// подъём нагрузки при homing считается заклиниванием.
+bool onLoadArc(float absoluteDeg) {
+  const float plusOffset = EncoderTracker::normalizeDegrees(absoluteDeg - getHomeAngleDeg());
+  return (plusOffset > 0.0f) && (plusOffset <= Config::LOAD_ARC_WIDTH_DEG);
+}
+
+// Оставшийся путь до дома по тому маршруту, которым его ведёт homeStepDir (в
+// градусах, >= 0). Нужен детекторам застревания: при длинном пути кратчайший угол
+// до дома сначала РАСТЁТ, и мерить прогресс по нему нельзя.
+float homeRemainingDeg(float absoluteDeg) {
+  const int32_t dir = Config::HOME_DIRECTION;
+  const float delta = EncoderTracker::shortestDeltaDegrees(getHomeAngleDeg(), absoluteDeg);
+  if ((delta * dir) > 0.0f && fabsf(delta) <= Config::HOME_OVERSHOOT_BAND_DEG) {
+    return fabsf(delta);
+  }
+  // Путь в направлении dir: при dir = -1 это смещение от дома в «+», при dir = +1 -
+  // смещение в «-».
+  return EncoderTracker::normalizeDegrees(-dir * (absoluteDeg - getHomeAngleDeg()));
 }
 
 // Выполняет одно измерение нагрузки в покое. Мотор ОБЯЗАТЕЛЬНО должен быть уже
@@ -638,6 +714,10 @@ bool runHoming(HomeDirPolicy policy) {
   // цикл, обычная локальная переменная.
   float baselineLoadKg = -1.0f;
   uint32_t safetyCounter = 0;
+  // Детектор застревания: лучший (наименьший) оставшийся путь до дома и момент
+  // последнего приближения к нему.
+  float bestRemainingDeg = 1e9f;
+  uint32_t lastProgressMs = millis();
   while (true) {
     if (!gEncoder.update()) {
       Serial.println("[ERROR] Encoder read failed during homing move");
@@ -647,6 +727,17 @@ bool runHoming(HomeDirPolicy policy) {
     const float absoluteDeg = gEncoder.getAbsoluteDegrees();
     const float homeErrorDeg = EncoderTracker::shortestDeltaDegrees(absoluteDeg, getHomeAngleDeg());
 
+    const float remainingDeg = homeRemainingDeg(absoluteDeg);
+    if ((bestRemainingDeg - remainingDeg) >= Config::RETURN_HOME_MIN_PROGRESS_DEG) {
+      bestRemainingDeg = remainingDeg;
+      lastProgressMs = millis();
+    } else if ((millis() - lastProgressMs) >= Config::HOMING_STALL_TIMEOUT_MS) {
+      gMotor.stop();
+      Serial.printf("[ERROR] Homing stalled: no progress toward home (err=%.2f deg)\n", homeErrorDeg);
+      NetworkManager::queueEvent(buildEventJson("error", "homing_stalled").c_str());
+      return false;
+    }
+
     // Публикация актуальной позиции энкодера в общее состояние на каждом шаге
     // homing, чтобы [DIAG] и API /v1/status показывали движение вала ВО ВРЕМЯ homing
     // (этот цикл теперь выполняется в motorTask; loop() на другом ядре сообщает данные параллельно).
@@ -655,6 +746,8 @@ bool runHoming(HomeDirPolicy policy) {
 
     if (fabsf(homeErrorDeg) <= Config::ENCODER_HOME_WINDOW_DEG) {
       gMotor.stop();
+      // В окне дома вал стоит намеренно - это не застревание.
+      lastProgressMs = millis();
 
       // Не принимать домашнюю позицию по одному удачному отсчёту. После
       // переключения питания драйвера вал может ещё расслабляться или механически
@@ -686,9 +779,8 @@ bool runHoming(HomeDirPolicy policy) {
       continue;
     }
 
-    // Направление выбирается по УГЛУ + геометрии дуги: на короткой дуге нагрузки ->
-    // - вниз к домашней позиции (сброс); в длинной мёртвой зоне -> + вверх к домашней
-    // позиции через 0/360 (никогда через стенку). Нагрузка здесь никогда не выбирает направление.
+    // Направление - всегда Config::HOME_DIRECTION (кроме небольшого перелёта), см.
+    // homeStepDir. Нагрузка здесь никогда не выбирает направление.
     const int32_t stepDir = homeStepDir(policy, absoluteDeg);
 
     // Реактивная защита от стенки: когда идёт сброс нагрузки (движение -), но
@@ -696,8 +788,9 @@ bool runHoming(HomeDirPolicy policy) {
     // минимумом) на запас, это движение в стенку с другой стороны / заклинивший
     // механизм -> остановка и ERROR. Именно ПОДЪЁМ над базовой линией, а не
     // абсолютный уровень, поэтому законный сброс реальной нагрузки (~2 кг)
-    // допустим. Неприменимо при движении + (ALWAYS_PLUS намеренно увеличивает угол).
-    if (stepDir < 0) {
+    // допустим. Только на дуге нагрузки: вне её (обход по кругу) подъём нагрузки -
+    // штатный заход кулачка, а застревание ловит детектор выше.
+    if (stepDir < 0 && onLoadArc(absoluteDeg)) {
       const float loadKg = getLoadKg();
       if (baselineLoadKg < 0.0f || loadKg < baselineLoadKg) {
         baselineLoadKg = loadKg;
@@ -734,10 +827,13 @@ void moveTowardHome() {
   const float absoluteDeg = gEncoder.getAbsoluteDegrees();
   const float homeErrorDeg = EncoderTracker::shortestDeltaDegrees(absoluteDeg, getHomeAngleDeg());
   const float absHomeErrorDeg = fabsf(homeErrorDeg);
+  // Прогресс меряется по оставшемуся пути маршрута homing (всегда в одну сторону),
+  // а не по кратчайшему углу - см. homeRemainingDeg.
+  const float remainingDeg = homeRemainingDeg(absoluteDeg);
 
   if ((gReturnHomeLastProgressMs == 0U) ||
-      ((gReturnHomeBestErrorDeg - absHomeErrorDeg) >= Config::RETURN_HOME_MIN_PROGRESS_DEG)) {
-    gReturnHomeBestErrorDeg = absHomeErrorDeg;
+      ((gReturnHomeBestErrorDeg - remainingDeg) >= Config::RETURN_HOME_MIN_PROGRESS_DEG)) {
+    gReturnHomeBestErrorDeg = remainingDeg;
     gReturnHomeLastProgressMs = millis();
   } else if ((millis() - gReturnHomeLastProgressMs) >= Config::RETURN_HOME_STALL_TIMEOUT_MS) {
     gMotor.stop();
@@ -794,9 +890,8 @@ void moveTowardHome() {
     return;
   }
 
-  // Направление основано на угле + дуге: на короткой дуге нагрузки -> - для сброса;
-  // в длинной мёртвой зоне -> + вверх к домашней позиции через 0/360 (никогда через
-  // стенку). Не на основе нагрузки.
+  // Направление - всегда Config::HOME_DIRECTION (кроме небольшого перелёта), см.
+  // homeStepDir. Не на основе нагрузки.
   const int32_t stepDir = homeStepDir(HomeDirPolicy::BY_LOAD, absoluteDeg);
 
   // Реактивная защита от стенки: сброс нагрузки (движение -), но нагрузка
@@ -804,7 +899,8 @@ void moveTowardHome() {
   // gReturnHomeBaselineKg) на запас, означает движение в стенку / заклинивание.
   // Именно ПОДЪЁМ над базовой линией, а не абсолютный уровень, поэтому нормальный
   // возврат из-под реальной удерживаемой нагрузки (~2 кг) сбрасывается корректно.
-  if (stepDir < 0) {
+  // Только на дуге нагрузки (см. runHoming).
+  if (stepDir < 0 && onLoadArc(absoluteDeg)) {
     const float loadKg = getLoadKg();
     if (gReturnHomeBaselineKg < 0.0f || loadKg < gReturnHomeBaselineKg) {
       gReturnHomeBaselineKg = loadKg;
@@ -823,22 +919,31 @@ void moveTowardHome() {
 
 // ── Калибровка нуля кулачков: один такт состояния CALIBRATE ──────────────────
 // Вызывается из motorTask (владелец мотора/энкодера) на каждом такте, пока состояние
-// CALIBRATE. Делает один медленный шаг в направлении gCalibDir либо обрабатывает
-// запрос завершения/отмены и срабатывание защит.
-//   * STOP / кнопка на стенде (gCalibFinishRequested): остановка, успокоение, текущий
-//     абсолютный угол энкодера становится НОВЫМ домашним углом (логическим нулём),
-//     сохраняется в NVS -> IDLE. Событие "calib": "home=<новый> prev=<старый>".
-//   * HOME (gCalibCancelRequested): остановка, ноль НЕ меняется, запрашивается
-//     обычный homing к прежнему нулю.
-//   * Защиты (ход > CALIB_MAX_TRAVEL_STEPS либо рост нагрузки): остановка, ноль НЕ
-//     меняется -> IDLE. Событие "calib": "aborted_travel" / "aborted_load".
+// CALIBRATE. В режиме калибровки вал стоит (мотор включён и держит положение), пока
+// оператор не попросит движения:
+//   * непрерывное вращение (gCalibRunDir = +1 / -1) до «стоп»;
+//   * поворот на заданный угол (остаток в gCalibJogPending, по шагу за такт).
+// Плюс запросы:
+//   * «сохранить» (gCalibFinishRequested): остановка, успокоение, текущий абсолютный
+//     угол энкодера становится НОВЫМ домашним углом, сохраняется в NVS -> IDLE.
+//     Событие "calib": "home=<новый> prev=<старый>".
+//   * «отмена» (gCalibCancelRequested): ноль НЕ меняется, homing к прежнему нулю.
+//   * «стоп» (gCalibHaltRequested, кнопка на стенде): прекратить движение.
+// Защиты (движение прекращается, режим сохраняется, событие "calib"):
+//   * непрерывное вращение дольше CALIB_MAX_TRAVEL_STEPS -> "aborted_travel";
+//   * рост нагрузки -> "aborted_load".
+// Бездействие дольше CALIB_IDLE_TIMEOUT_MS -> выход в IDLE без движения, "timeout".
 void calibrateTick() {
   static uint8_t overloadTicks = 0;
+  static bool wasMoving = false;
 
   if (gCalibFinishRequested) {
     gCalibFinishRequested = false;
     gCalibCancelRequested = false;
+    gCalibRunDir = 0;
+    clearCalibJog();
     overloadTicks = 0;
+    wasMoving = false;
     gMotor.stop();
     delay(Config::HOMING_VERIFY_SETTLE_MS);
     if (!gEncoder.update()) {
@@ -868,7 +973,10 @@ void calibrateTick() {
 
   if (gCalibCancelRequested) {
     gCalibCancelRequested = false;
+    gCalibRunDir = 0;
+    clearCalibJog();
     overloadTicks = 0;
+    wasMoving = false;
     gMotor.stop();
     // Через IDLE: ветка gRehomeRequested в motorTask принимает запрос только из
     // IDLE/ERROR и сама ведёт вал к ПРЕЖНЕМУ (не изменённому) нулю.
@@ -880,29 +988,57 @@ void calibrateTick() {
     return;
   }
 
-  // Защита по ходу: забытая калибровка не крутит вал бесконечно.
-  if (abs(gMotor.getExpectedSteps() - gCalibStartSteps) >= Config::CALIB_MAX_TRAVEL_STEPS) {
-    overloadTicks = 0;
-    gMotor.stop();
-    setState(SystemState::IDLE);
-    NetworkManager::queueEvent(buildEventJson("calib", "aborted_travel").c_str());
-    Serial.println("[CALIB] Aborted: travel limit reached, zero unchanged");
-    return;
+  if (gCalibHaltRequested) {
+    gCalibHaltRequested = false;
+    gCalibRunDir = 0;
+    clearCalibJog();
   }
 
+  // Что делаем на этом такте: шаг непрерывного вращения, шаг поворота или стоим.
+  int8_t dir = 0;
+  if (gCalibRunDir != 0) {
+    dir = gCalibRunDir;
+    // Защита от забытого вращения.
+    if (abs(gMotor.getExpectedSteps() - gCalibStartSteps) >= Config::CALIB_MAX_TRAVEL_STEPS) {
+      gCalibRunDir = 0;
+      dir = 0;
+      NetworkManager::queueEvent(buildEventJson("calib", "aborted_travel").c_str());
+      Serial.println("[CALIB] Rotation stopped: travel limit reached");
+    }
+  } else {
+    dir = takeCalibJogStep();
+  }
+
+  if (dir == 0) {
+    if (wasMoving) {
+      wasMoving = false;
+      overloadTicks = 0;
+      gMotor.stop();
+      gCalibActivityMs = millis();
+    }
+    if ((millis() - gCalibActivityMs) >= Config::CALIB_IDLE_TIMEOUT_MS) {
+      setState(SystemState::IDLE);
+      NetworkManager::queueEvent(buildEventJson("calib", "timeout").c_str());
+      Serial.println("[CALIB] Idle timeout, leaving calibration (zero unchanged)");
+    }
+    return;
+  }
+  wasMoving = true;
+
   // Защита по нагрузке: кулачки вдавливаются в плату. Порог отсчитывается и от
-  // абсолютного уровня, и от стартовой нагрузки, чтобы калибровку можно было начать
-  // (в сторону сброса) даже когда кулачки уже поджимают плату.
+  // абсолютного уровня, и от нагрузки в начале движения, чтобы можно было
+  // двигаться в сторону сброса, даже когда кулачки уже поджимают плату.
   const float loadKg = getLoadKg();
   const float limitKg = max(Config::CALIB_MAX_LOAD_KG,
                             static_cast<float>(gCalibStartLoadKg) + Config::CALIB_LOAD_RISE_KG);
   if (getLoadReady() && loadKg > limitKg) {
     if (++overloadTicks >= Config::CALIB_OVERLOAD_TICKS) {
       overloadTicks = 0;
+      gCalibRunDir = 0;
+      clearCalibJog();
       gMotor.stop();
-      setState(SystemState::IDLE);
       NetworkManager::queueEvent(buildEventJson("calib", "aborted_load").c_str());
-      Serial.printf("[CALIB] Aborted: load %.3fkg above limit %.3fkg, zero unchanged\n",
+      Serial.printf("[CALIB] Motion stopped: load %.3fkg above limit %.3fkg\n",
                     static_cast<double>(loadKg), static_cast<double>(limitKg));
       return;
     }
@@ -910,7 +1046,8 @@ void calibrateTick() {
     overloadTicks = 0;
   }
 
-  gMotor.moveSteps(gCalibDir > 0 ? 1 : -1, Config::CALIB_STEP_INTERVAL_US);
+  gMotor.moveSteps(dir, Config::CALIB_STEP_INTERVAL_US);
+  gCalibActivityMs = millis();
 }
 
 void loadTask(void* parameter) {
@@ -1328,7 +1465,7 @@ void motorTask(void* parameter) {
       lastState = currentState;
       if (currentState == SystemState::RETURN_HOME) {
         const float absoluteDeg = gEncoder.getAbsoluteDegrees();
-        gReturnHomeBestErrorDeg = fabsf(EncoderTracker::shortestDeltaDegrees(absoluteDeg, getHomeAngleDeg()));
+        gReturnHomeBestErrorDeg = homeRemainingDeg(absoluteDeg);
         gReturnHomeLastProgressMs = millis();
         // Новый прогон RETURN_HOME: базовое значение нагрузки для реактивной
         // защиты сбрасывается, чтобы оно заново захватило текущий минимум для
@@ -1383,6 +1520,27 @@ void motorTask(void* parameter) {
       }
     } else {
       encoderFaultCounter = 0;
+    }
+
+    // Автоотключение мотора без нагрузки: в покое, если нагрузка не больше
+    // MOTOR_RELEASE_MAX_KG дольше MOTOR_RELEASE_DELAY_MS, драйвер отключается через
+    // EN. Включается обратно сам - первым же шагом (StepperMotor::moveSteps).
+    if (Config::MOTOR_AUTO_RELEASE) {
+      static uint32_t noLoadSinceMs = 0;
+      const SystemState s = getState();
+      const bool still = (s == SystemState::IDLE || s == SystemState::HOLD_LOAD ||
+                          s == SystemState::ERROR);
+      const bool noLoad = getLoadReady() && fabsf(getLoadKg()) <= Config::MOTOR_RELEASE_MAX_KG;
+      if (still && noLoad && !gRehomeRequested && !gBootHomeRequested) {
+        if (noLoadSinceMs == 0) noLoadSinceMs = millis() | 1U;
+        if (gMotor.isEnabled() && (millis() - noLoadSinceMs) >= Config::MOTOR_RELEASE_DELAY_MS) {
+          gMotor.setEnabled(false);
+          NetworkManager::queueEvent(buildEventJson("motor", "released").c_str());
+          Serial.println("[MOTOR] released (no load)");
+        }
+      } else {
+        noLoadSinceMs = 0;
+      }
     }
 
     switch (getState()) {
@@ -1590,10 +1748,10 @@ void loop() {
       setState(SystemState::RETURN_HOME);
       Serial.println("[STATE] RETURN_HOME");
     } else if (state == SystemState::CALIBRATE) {
-      // Кнопка на стенде во время калибровки = STOP: оператор стоит у кулачков и
-      // фиксирует ноль прямо с места.
-      gCalibFinishRequested = true;
-      Serial.println("[CALIB] stop requested (button)");
+      // Кнопка на стенде во время калибровки = «стоп»: прекратить вращение / поворот.
+      // Ноль сохраняется только с панели (после входа по паролю).
+      gCalibHaltRequested = true;
+      Serial.println("[CALIB] halt requested (button)");
     } else if (state == SystemState::ERROR) {
       // Восстановление из ERROR кнопкой вместо необходимости физического RST.
       // Сам повторный homing выполняется в motorTask (он владеет
@@ -1658,8 +1816,8 @@ void loop() {
 // получает запись, но ничто не движется. 200 от REST означает ПОСТАВЛЕНО В
 // ОЧЕРЕДЬ, а не выполнено; поштучное подтверждение (ack) на команду - отдельная
 // возможность.
-void NetworkManager::onCommand(NetCommand::Command cmd) {
-  Serial.printf("[NET] cmd=%s\n", NetCommand::commandName(cmd));
+void NetworkManager::onCommand(NetCommand::Command cmd, int32_t arg) {
+  Serial.printf("[NET] cmd=%s arg=%ld\n", NetCommand::commandName(cmd), static_cast<long>(arg));
 
   const SystemState state = getState();
 
@@ -1742,10 +1900,10 @@ void NetworkManager::onCommand(NetCommand::Command cmd) {
         Serial.println("[STATE] HOLD_LOAD (net, stop)");
         ackAccepted();
       } else if (state == SystemState::CALIBRATE) {
-        // Оператор увидел, что кулачки в нуле: motorTask остановит вал и примет
-        // текущий угол за новый логический ноль (см. calibrateTick).
-        gCalibFinishRequested = true;
-        Serial.println("[CALIB] stop requested (net)");
+        // «Стоп» в калибровке - только остановка движения (доступна без входа: это
+        // безопасность). Ноль сохраняется отдельной командой CALIB_SAVE.
+        gCalibHaltRequested = true;
+        Serial.println("[CALIB] halt requested (net)");
         ackAccepted();
       } else {
         Serial.printf("[NET] STOP ignored in state %s\n", toString(state));
@@ -1779,23 +1937,85 @@ void NetworkManager::onCommand(NetCommand::Command cmd) {
       break;
     }
 
-    case NetCommand::Command::CALIB_PLUS:
-    case NetCommand::Command::CALIB_MINUS:
-      // Калибровка нуля кулачков: только из покоя (IDLE) или из аварии (ERROR - на
-      // случай, когда с новыми кулачками не проходит сам homing). Вращение ведёт
-      // motorTask (calibrateTick) до команды STOP.
+    // ── Калибровка нуля кулачков. Эти команды приходят ТОЛЬКО через POST /v1/calib
+    // после проверки токена входа (NetworkManager.cpp); здесь - проверка состояния.
+    case NetCommand::Command::CALIB_ENTER:
+      // Вход в режим: только из покоя (IDLE) или из аварии (ERROR - на случай, когда
+      // с новыми кулачками не проходит сам homing). Вал стоит до команды движения.
       if (state == SystemState::IDLE || state == SystemState::ERROR) {
-        gCalibDir = (cmd == NetCommand::Command::CALIB_PLUS) ? 1 : -1;
+        gCalibRunDir = 0;
+        clearCalibJog();
         gCalibFinishRequested = false;
         gCalibCancelRequested = false;
+        gCalibHaltRequested = false;
         gRehomeRequested = false;
-        gCalibStartSteps = gMotor.getExpectedSteps();
-        gCalibStartLoadKg = getLoadKg();
+        gCalibActivityMs = millis();
         setState(SystemState::CALIBRATE);
-        Serial.printf("[STATE] CALIBRATE (net, dir=%c)\n", gCalibDir > 0 ? '+' : '-');
+        Serial.println("[STATE] CALIBRATE (net)");
         ackAccepted();
       } else {
-        Serial.printf("[NET] CALIB ignored in state %s\n", toString(state));
+        Serial.printf("[NET] CALIB_ENTER ignored in state %s\n", toString(state));
+        ackIgnored();
+      }
+      break;
+
+    case NetCommand::Command::CALIB_RUN:
+      if (state == SystemState::CALIBRATE && (arg == 1 || arg == -1)) {
+        clearCalibJog();
+        gCalibHaltRequested = false;
+        gCalibStartSteps = gMotor.getExpectedSteps();
+        gCalibStartLoadKg = getLoadKg();
+        gCalibActivityMs = millis();
+        gCalibRunDir = static_cast<int8_t>(arg);
+        Serial.printf("[CALIB] run %c\n", arg > 0 ? '+' : '-');
+        ackAccepted();
+      } else {
+        ackIgnored();
+      }
+      break;
+
+    case NetCommand::Command::CALIB_JOG:
+      // Поворот на заданный угол. Во время непрерывного вращения не принимается -
+      // панель сначала шлёт «стоп».
+      if (state == SystemState::CALIBRATE && gCalibRunDir == 0 && arg != 0) {
+        if (getCalibJogPending() == 0) {
+          gCalibStartLoadKg = getLoadKg();
+        }
+        gCalibHaltRequested = false;
+        gCalibActivityMs = millis();
+        addCalibJog(arg);
+        Serial.printf("[CALIB] jog %ld steps\n", static_cast<long>(arg));
+        ackAccepted();
+      } else {
+        ackIgnored();
+      }
+      break;
+
+    case NetCommand::Command::CALIB_HALT:
+      if (state == SystemState::CALIBRATE) {
+        gCalibHaltRequested = true;
+        ackAccepted();
+      } else {
+        ackIgnored();
+      }
+      break;
+
+    case NetCommand::Command::CALIB_SAVE:
+      if (state == SystemState::CALIBRATE) {
+        gCalibFinishRequested = true;
+        Serial.println("[CALIB] save requested (net)");
+        ackAccepted();
+      } else {
+        ackIgnored();
+      }
+      break;
+
+    case NetCommand::Command::CALIB_CANCEL:
+      if (state == SystemState::CALIBRATE) {
+        gCalibCancelRequested = true;
+        Serial.println("[CALIB] cancel requested (net)");
+        ackAccepted();
+      } else {
         ackIgnored();
       }
       break;

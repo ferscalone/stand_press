@@ -6,9 +6,20 @@
 
 namespace NetCommand {
 
-// CALIB_PLUS / CALIB_MINUS - запуск калибровки нуля кулачков (медленное вращение в
-// сторону роста / уменьшения угла энкодера); завершается командой STOP.
-enum class Command { NONE, SEEK, HOME, STOP, TARE, CALIB_PLUS, CALIB_MINUS };
+// CALIB_* - команды режима калибровки нуля кулачков. Они НЕ разбираются из
+// текстовых кадров WS / параметра cmd: их ставит в очередь только эндпойнт
+// POST /v1/calib после проверки токена входа (см. NetworkManager.cpp). Аргумент
+// команды (arg) передаётся вместе с ней в onCommand():
+//   CALIB_ENTER  - войти в режим (из IDLE / ERROR), вал стоит;
+//   CALIB_RUN    - непрерывное вращение, arg = +1 / -1;
+//   CALIB_HALT   - остановить вращение / поворот (режим сохраняется);
+//   CALIB_JOG    - повернуть на arg шагов (со знаком направления);
+//   CALIB_SAVE   - принять текущий угол за новый ноль и выйти;
+//   CALIB_CANCEL - выйти, ноль не менять, вернуться к прежнему нулю.
+enum class Command {
+    NONE, SEEK, HOME, STOP, TARE,
+    CALIB_ENTER, CALIB_RUN, CALIB_HALT, CALIB_JOG, CALIB_SAVE, CALIB_CANCEL
+};
 
 inline bool ieq(const char* a, const char* b) {
     while (*a && *b) {
@@ -28,8 +39,6 @@ inline Command parseCommand(const char* s) {
     if (ieq(s, "home")) return Command::HOME;
     if (ieq(s, "stop")) return Command::STOP;
     if (ieq(s, "tare")) return Command::TARE;
-    if (ieq(s, "calib_plus")) return Command::CALIB_PLUS;
-    if (ieq(s, "calib_minus")) return Command::CALIB_MINUS;
     return Command::NONE;
 }
 
@@ -39,8 +48,12 @@ inline const char* commandName(Command c) {
         case Command::HOME: return "HOME";
         case Command::STOP: return "STOP";
         case Command::TARE: return "TARE";
-        case Command::CALIB_PLUS: return "CALIB_PLUS";
-        case Command::CALIB_MINUS: return "CALIB_MINUS";
+        case Command::CALIB_ENTER: return "CALIB_ENTER";
+        case Command::CALIB_RUN: return "CALIB_RUN";
+        case Command::CALIB_HALT: return "CALIB_HALT";
+        case Command::CALIB_JOG: return "CALIB_JOG";
+        case Command::CALIB_SAVE: return "CALIB_SAVE";
+        case Command::CALIB_CANCEL: return "CALIB_CANCEL";
         default:            return "NONE";
     }
 }

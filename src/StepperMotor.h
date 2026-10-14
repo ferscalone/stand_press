@@ -13,6 +13,10 @@ class StepperMotor {
   int32_t getExpectedSteps() const;
   float getExpectedDegrees() const;
   void resetExpectedPosition();
+  // Вход EN драйвера: false - мотор обесточен (вал свободен). moveSteps() сам
+  // включает драйвер перед первым шагом.
+  void setEnabled(bool enabled);
+  bool isEnabled() const;
 
  private:
   void pulseStep(uint32_t stepIntervalUs);
@@ -25,5 +29,6 @@ class StepperMotor {
   uint8_t dirMinusPin_;
   bool directionForward_ = true;
   int32_t expectedSteps_ = 0;
+  volatile bool enabled_ = true;
 };
 

@@ -22,13 +22,13 @@ String buildTelemetryJson() {
   const uint32_t uptimeMs = millis();
   const float targetKg = snap.targetKg;
 
-  char buf[448];
+  char buf[512];
   const int written = snprintf(buf, sizeof(buf),
            "{\"state\":\"%s\",\"load_kg\":%.3f,\"target_kg\":%.3f,"
            "\"range_min_kg\":%.3f,\"range_max_kg\":%.3f,"
            "\"load_raw\":%ld,\"load_ready\":%d,\"uptime_ms\":%lu,"
            "\"encoder_abs_deg\":%.2f,\"encoder_rel_deg\":%.2f,\"encoder_fault\":%d,"
-           "\"load_offset\":%ld,\"tare_ok\":%d,\"home_abs_deg\":%.2f}",
+           "\"load_offset\":%ld,\"tare_ok\":%d,\"home_abs_deg\":%.2f,\"motor_en\":%d,\"calib_busy\":%d}",
            toString(snap.state),
            static_cast<double>(snap.loadKg),
            static_cast<double>(targetKg),
@@ -42,7 +42,9 @@ String buildTelemetryJson() {
            snap.encoderFault ? 1 : 0,
            snap.loadOffset,
            snap.tareOk ? 1 : 0,
-           static_cast<double>(snap.homeAbsDeg));
+           static_cast<double>(snap.homeAbsDeg),
+           snap.motorEnabled ? 1 : 0,
+           snap.calibBusy ? 1 : 0);
   if (written < 0 || written >= static_cast<int>(sizeof(buf))) {
     Serial.println("[TELEMETRY][WARN] JSON truncated, buf too small");
   }

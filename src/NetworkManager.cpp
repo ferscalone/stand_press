@@ -24,6 +24,11 @@ namespace {
 AsyncWebServer sServer(Config::NET_HTTP_PORT);
 AsyncWebSocket sWs(Config::NET_WS_PATH);
 
+// Элемент очереди команд: сама команда + её аргумент (для CALIB_*).
+struct CmdMsg {
+  NetCommand::Command cmd;
+  int32_t arg;
+};
 QueueHandle_t sCmdQueue = nullptr;
 uint32_t sLastTelemetryMs = 0;
 bool sMdnsStarted = false;
@@ -94,15 +99,173 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 // для NONE (нераспознано) или если очередь полна/отсутствует. И обработчик WS, и
 // эндпойнт REST /v1/command проходят через это, чтобы поведение постановки в
 // очередь оставалось одинаковым для всех транспортов.
-bool enqueueCommand(NetCommand::Command cmd) {
+bool enqueueCommand(NetCommand::Command cmd, int32_t arg = 0) {
   if (cmd == NetCommand::Command::NONE) {
     return false;
   }
   if (!sCmdQueue) {
     return false;
   }
-  const NetCommand::Command qCmd = cmd;
-  return xQueueSend(sCmdQueue, &qCmd, 0) == pdTRUE;
+  const CmdMsg msg{cmd, arg};
+  return xQueueSend(sCmdQueue, &msg, 0) == pdTRUE;
+}
+
+void sendJsonCors(AsyncWebServerRequest* request, int code, const String& body);
+
+// ── Вход в режим калибровки нуля кулачков ────────────────────────────────────
+// Логины и пароли - Secrets::CALIB_USERS. Успешный вход выдаёт случайный токен; он
+// возвращается ТОЛЬКО в ответе на HTTP-запрос входа (не рассылается по WS), и все
+// команды калибровки (POST /v1/calib) обязаны его предъявить. Токен один на стенд:
+// новый вход заменяет прежний. Срок жизни - CALIB_SESSION_TIMEOUT_MS с последней
+// команды. Всё состояние ниже трогает только задача AsyncTCP (обработчик
+// /v1/calib), поэтому блокировка не нужна.
+//
+// Ограничение: стенд работает по обычному HTTP без шифрования, поэтому пароль
+// идёт по локальной сети открытым текстом. Это защита от случайного/постороннего
+// доступа через панель, а не от перехвата трафика.
+char sCalibToken[17] = {0};
+char sCalibUser[32] = {0};
+uint32_t sCalibTokenUseMs = 0;
+uint8_t sLoginFails = 0;
+uint32_t sLoginLockUntilMs = 0;
+
+// Сравнение строк за время, не зависящее от места первого расхождения.
+bool safeEquals(const char* a, const char* b) {
+  const size_t la = strlen(a);
+  const size_t lb = strlen(b);
+  uint8_t diff = (la != lb) ? 1 : 0;
+  for (size_t i = 0; i < la; ++i) {
+    diff |= static_cast<uint8_t>(a[i] ^ (i < lb ? b[i] : 0));
+  }
+  return diff == 0;
+}
+
+bool calibTokenValid(const String& token) {
+  if (sCalibToken[0] == '\0' || token.length() == 0) {
+    return false;
+  }
+  if ((millis() - sCalibTokenUseMs) >= Config::CALIB_SESSION_TIMEOUT_MS) {
+    sCalibToken[0] = '\0';
+    return false;
+  }
+  return safeEquals(token.c_str(), sCalibToken);
+}
+
+// Значение параметра из тела form-urlencoded или строки запроса ("" если нет).
+String calibParam(AsyncWebServerRequest* request, const char* name) {
+  if (request->hasParam(name, true)) return request->getParam(name, true)->value();
+  if (request->hasParam(name)) return request->getParam(name)->value();
+  return String();
+}
+
+void handleCalibRequest(AsyncWebServerRequest* request) {
+  String action = calibParam(request, "action");
+  action.trim();
+
+  if (action == "login") {
+    const uint32_t now = millis();
+    if (sLoginLockUntilMs != 0 && static_cast<int32_t>(sLoginLockUntilMs - now) > 0) {
+      String body = "{\"error\":\"locked\",\"retry_s\":";
+      body += String((sLoginLockUntilMs - now) / 1000 + 1);
+      body += "}";
+      sendJsonCors(request, 429, body);
+      return;
+    }
+    sLoginLockUntilMs = 0;
+    const String user = calibParam(request, "user");
+    const String pass = calibParam(request, "pass");
+    const Secrets::CalibUser* match = nullptr;
+    for (const Secrets::CalibUser& u : Secrets::CALIB_USERS) {
+      // Пароль проверяется у каждой записи, чтобы время ответа не выдавало логин.
+      const bool ok = safeEquals(user.c_str(), u.login) & safeEquals(pass.c_str(), u.password);
+      if (ok && match == nullptr) match = &u;
+    }
+    if (match == nullptr) {
+      if (++sLoginFails >= Config::CALIB_LOGIN_MAX_FAILS) {
+        sLoginFails = 0;
+        sLoginLockUntilMs = now + Config::CALIB_LOGIN_LOCK_MS;
+        Serial.println("[CALIB] login locked after repeated failures");
+      }
+      Serial.println("[CALIB] login failed");
+      sendJsonCors(request, 401, "{\"error\":\"bad credentials\"}");
+      return;
+    }
+    sLoginFails = 0;
+    snprintf(sCalibToken, sizeof(sCalibToken), "%08lx%08lx",
+             static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
+    strlcpy(sCalibUser, match->login, sizeof(sCalibUser));
+    sCalibTokenUseMs = now;
+    Serial.printf("[CALIB] login ok: %s\n", sCalibUser);
+    String body = "{\"token\":\"";
+    body += sCalibToken;
+    body += "\",\"user\":\"";
+    body += sCalibUser;
+    body += "\",\"ttl_s\":";
+    body += String(Config::CALIB_SESSION_TIMEOUT_MS / 1000);
+    body += "}";
+    sendJsonCors(request, 200, body);
+    return;
+  }
+
+  if (!calibTokenValid(calibParam(request, "token"))) {
+    sendJsonCors(request, 401, "{\"error\":\"unauthorized\"}");
+    return;
+  }
+  sCalibTokenUseMs = millis();
+
+  if (action == "logout") {
+    sCalibToken[0] = '\0';
+    sendJsonCors(request, 200, "{\"ok\":true}");
+    return;
+  }
+
+  NetCommand::Command cmd = NetCommand::Command::NONE;
+  int32_t arg = 0;
+  if (action == "enter") {
+    cmd = NetCommand::Command::CALIB_ENTER;
+  } else if (action == "halt") {
+    cmd = NetCommand::Command::CALIB_HALT;
+  } else if (action == "save") {
+    cmd = NetCommand::Command::CALIB_SAVE;
+  } else if (action == "cancel") {
+    cmd = NetCommand::Command::CALIB_CANCEL;
+  } else if (action == "run" || action == "jog") {
+    // Направление словами: "+" в form-urlencoded превращается в пробел.
+    const String dir = calibParam(request, "dir");
+    int32_t sign = 0;
+    if (dir == "plus") sign = 1;
+    if (dir == "minus") sign = -1;
+    if (sign == 0) {
+      sendJsonCors(request, 400, "{\"error\":\"bad dir\"}");
+      return;
+    }
+    if (action == "run") {
+      cmd = NetCommand::Command::CALIB_RUN;
+      arg = sign;
+    } else {
+      const float deg = calibParam(request, "deg").toFloat();
+      if (!(deg > 0.0f) || deg > Config::CALIB_JOG_MAX_DEG) {
+        sendJsonCors(request, 400, "{\"error\":\"bad deg\"}");
+        return;
+      }
+      long steps = lroundf(deg / Config::DEGREES_PER_STEP);
+      if (steps < 1) steps = 1;
+      cmd = NetCommand::Command::CALIB_JOG;
+      arg = sign * static_cast<int32_t>(steps);
+    }
+  } else {
+    sendJsonCors(request, 400, "{\"error\":\"unknown action\"}");
+    return;
+  }
+
+  if (!enqueueCommand(cmd, arg)) {
+    sendJsonCors(request, 503, "{\"error\":\"queue full\"}");
+    return;
+  }
+  String body = "{\"accepted\":\"";
+  body += NetCommand::commandName(cmd);
+  body += "\"}";
+  sendJsonCors(request, 202, body);
 }
 
 // Отправляет тело JSON с заголовком Access-Control-Allow-Origin:*, чтобы дашборд,
@@ -181,7 +344,7 @@ void handleWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
 
 void NetworkManager::begin() {
   // Создать очередь команд раньше всего, что могло бы в неё что-то отправить.
-  sCmdQueue = xQueueCreate(Config::NET_CMD_QUEUE_SIZE, sizeof(NetCommand::Command));
+  sCmdQueue = xQueueCreate(Config::NET_CMD_QUEUE_SIZE, sizeof(CmdMsg));
 
   // Очередь широковещательной рассылки событий по возможности, вычерпывается в loop().
   sEventQueue = xQueueCreate(8, sizeof(EventMsg));
@@ -412,6 +575,26 @@ void NetworkManager::begin() {
     request->send(r);
   });
 
+  // POST /v1/calib - режим калибровки нуля кулачков. Параметры в теле
+  // form-urlencoded (пароль не должен попадать в URL):
+  //   action=login&user=..&pass=..           -> 200 {"token":..} / 401 / 429
+  //   action=enter|halt|save|cancel|logout&token=..
+  //   action=run&dir=plus|minus&token=..
+  //   action=jog&dir=plus|minus&deg=1..90&token=..
+  // Команды ставятся в очередь (202); фактический приём/отказ по состоянию стенда
+  // приходит событием WS "ack". Неверный/просроченный токен -> 401.
+  sServer.on("/v1/calib", HTTP_POST, [](AsyncWebServerRequest* request) {
+    handleCalibRequest(request);
+  });
+
+  sServer.on("/v1/calib", HTTP_OPTIONS, [](AsyncWebServerRequest* request) {
+    AsyncWebServerResponse* r = request->beginResponse(204);
+    r->addHeader("Access-Control-Allow-Origin", "*");
+    r->addHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    r->addHeader("Access-Control-Allow-Headers", "Content-Type");
+    request->send(r);
+  });
+
   sServer.begin();
 }
 
@@ -420,11 +603,11 @@ void NetworkManager::loop() {
   // цикл, чтобы поток команд не заморил остальную часть loop() - не более одной
   // глубины очереди за вызов.
   if (sCmdQueue) {
-    NetCommand::Command cmd;
+    CmdMsg msg;
     UBaseType_t remaining = uxQueueMessagesWaiting(sCmdQueue);
     while (remaining-- > 0) {
-      if (xQueueReceive(sCmdQueue, &cmd, 0) == pdTRUE) {
-        onCommand(cmd);
+      if (xQueueReceive(sCmdQueue, &msg, 0) == pdTRUE) {
+        onCommand(msg.cmd, msg.arg);
       }
     }
   }
@@ -560,6 +743,7 @@ String NetworkManager::wifiIp() {
 // Слабая реализация по умолчанию: просто пишет команду в лог. Ожидается, что .ino
 // переопределит её реальной реализацией, управляющей машиной состояний
 // (START/STOP/PARK).
-__attribute__((weak)) void NetworkManager::onCommand(NetCommand::Command cmd) {
+__attribute__((weak)) void NetworkManager::onCommand(NetCommand::Command cmd, int32_t arg) {
+  (void)arg;
   Serial.printf("[NetManager] cmd=%s (default stub)\n", NetCommand::commandName(cmd));
 }
